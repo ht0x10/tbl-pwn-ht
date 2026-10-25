@@ -34,9 +34,13 @@ ARMA=$(tok_sp "$AUTO_APP" "$ASEC" "https://management.azure.com/.default")
 KEY0=$(curl -sS -X POST -H "Authorization: Bearer $ARMA" -H "Content-Length: 0" \
   "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG_SEA/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-01-01" \
   | python3 -c "import sys,json;print(json.load(sys.stdin)['keys'][0]['value'])")
-RSVC_OID=$(curl -sS -H "Authorization: Bearer $G" \
-  "https://graph.microsoft.com/v1.0/applications?\$filter=appId eq '$RSVC'&\$select=id" \
-  | python3 -c "import sys,json;print(json.load(sys.stdin)['value'][0]['id'])")
+curl -sS -H "Authorization: Bearer $G" \
+  "https://graph.microsoft.com/v1.0/applications?\$top=100&\$select=id,appId,displayName" > /tmp/apps.json
+RSVC_OID=$(python3 -c "
+import json,sys
+rsvc='$RSVC'
+for a in json.load(open('/tmp/apps.json'))['value']:
+    if a['appId']==rsvc: print(a['id']); break")
 echo "[*] prefix=$PFX graph=${#G} key=${#KEY0} rsvc_oid=$RSVC_OID"
 
 pip -q install azure-storage-blob pyjwt cryptography >/dev/null 2>&1
