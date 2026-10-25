@@ -164,7 +164,10 @@ else:
     def runsh(cmd): return run("bash -lc "+json.dumps(cmd))
 
     q=lambda s: urllib.parse.quote(s, safe="")
-    print("=== env trong app ==="); print(runsh("printenv | grep -iE 'IDENTITY|MSI|AWS|ARN|ROLE' | sort")[:1500])
+    print("=== FULL env (Kudu container) ==="); print(runsh("printenv | sort")[:2500])
+    print("=== ls wwwroot ==="); print(runsh("ls -la /home/site/wwwroot")[:800])
+    print("=== source đang deploy (tìm role/bucket/MSI) ===")
+    print(runsh("grep -rIniE 'arn:aws|assume-role|AssumeRole|s3|bucket|IDENTITY_ENDPOINT|get_token|web-identity|role_arn|sts' /home/site/wwwroot 2>/dev/null | head -40")[:2500])
     rolearn=runsh("printenv AWS_ROLE_ARN").strip()
     print("   AWS_ROLE_ARN env =", rolearn[:160])
 
